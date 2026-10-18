@@ -194,11 +194,10 @@ class WorkerService(protocol.WorkerServicer):
         # at process exit if not joined); positive bounds the
         # wait; ``None`` means "wait indefinitely" — caller asked
         # for unlimited graceful shutdown via a negative or
-        # missing StopRequest timeout. The default below is
-        # ``None`` only because the loop pool's finalizer
-        # schedules its own ``loop.stop()``, so an unbounded join
-        # still returns once ``run_forever`` exits.
+        # missing StopRequest timeout. ``None`` is used only after
+        # an explicit stop request; idle retirement has a finite bound.
         self._stop_timeout: float | None = None
+        self._stop_requested = False
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -693,12 +692,15 @@ class WorkerService(protocol.WorkerServicer):
         closes without ``Task was destroyed but it is pending!`` warnings;
         past it, the daemon-thread reap at process exit is the backstop.
 
-        Finally joins the worker thread for up to `_stop_timeout` seconds.
-        ``0`` does not wait and ``None`` waits indefinitely; a thread still
-        running at the bound is reaped at process exit. With ``0``, the
-        clears and the drain run on the worker thread after this returns;
-        each loop clears its own partition, so that path cannot race a
-        successor loop's first use of the process-wide channel pool.
+        Finally joins the worker thread for up to `_stop_timeout` seconds
+        when stop was requested. Idle retirement instead waits for the
+        drain budget plus one clear floor per pool. ``0`` does not wait
+        and ``None`` waits indefinitely only for an explicit stop request;
+        a thread still running at a finite bound is left to the daemon
+        reap at process exit and reported. With ``0``, the clears and the
+        drain run on the worker thread after this returns; each loop clears
+        its own partition, so that path cannot race a successor loop's
+        first use of the process-wide channel pool.
 
         The drain tolerates a peer on the loop, i.e., another task that
         cancels or awaits the loop's tasks. A peer's cancel neither raises
@@ -907,11 +909,21 @@ class WorkerService(protocol.WorkerServicer):
             # via the ``_run_then_close`` finally clause.
             return
 
-        timeout = self._stop_timeout
+        timeout = (
+            self._stop_timeout
+            if self._stop_requested
+            else _DRAIN_TIMEOUT + len(clears) * _CLEAR_FLOOR
+        )
         if timeout is None or timeout > 0:
             # Offload the synchronous ``thread.join`` to a worker
             # thread so the main loop keeps pumping while we wait.
             await asyncio.get_running_loop().run_in_executor(None, thread.join, timeout)
+            if timeout is not None and thread.is_alive():
+                _log.warning(
+                    "Worker-loop thread did not stop within %.3fs after teardown; "
+                    "the daemon thread will be reaped at process exit.",
+                    timeout,
+                )
 
     @asynccontextmanager
     async def _tracked(
@@ -969,6 +981,7 @@ class WorkerService(protocol.WorkerServicer):
         # ``None`` (caller sent negative or omitted) → wait
         # indefinitely.
         self._stop_timeout = timeout
+        self._stop_requested = True
         self._stopping.set()
         await self._preempt(timeout=timeout)
         try:

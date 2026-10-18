@@ -562,6 +562,15 @@ async def _worker_loop_identity_probe():
     return (id(loop), thread.ident, thread.name)
 
 
+_idle_retirement_probe_loops: dict[str, asyncio.AbstractEventLoop] = {}
+
+
+async def _idle_retirement_worker_loop_probe(key: str):
+    loop = asyncio.get_running_loop()
+    _idle_retirement_probe_loops[key] = loop
+    return threading.current_thread().name
+
+
 async def _channel_pool_probe():
     """Report the worker loop's own view of the channel pool.
 
@@ -2542,6 +2551,177 @@ class TestWorkerService:
             "the idle TTL elapses; it is still alive, so the positive "
             "TTL did not finalize the idle loop"
         )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_bound_idle_retirement_when_worker_thread_is_blocked(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache, caplog
+    ):
+        """An idle worker retirement must not hold the pool lock indefinitely.
+
+        Given a worker loop whose thread blocks after a completed dispatch,
+        When its idle TTL expires and another request arrives,
+        Then the second request gets a new worker within the retirement
+        budget and the blocked daemon thread is reported.
+        """
+        ttl = 0.8
+        mocker.patch.object(service_module, "_WORKER_LOOP_TTL", ttl)
+        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+        mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
+        key = uuid4().hex
+        service = WorkerService()
+        loop = asyncio.get_running_loop()
+        block_started = threading.Event()
+        release_block = threading.Event()
+        first_thread: threading.Thread | None = None
+
+        try:
+            async with grpc_aio_stub(servicer=service) as stub:
+                first = stub.dispatch()
+                await first.write(
+                    protocol.Request(
+                        task=make_task(
+                            _idle_retirement_worker_loop_probe, args=(key,)
+                        ).to_protobuf()
+                    )
+                )
+                await first.done_writing()
+                first_responses = [response async for response in first]
+                assert first_responses[0].HasField("ack")
+                first_thread_name = cloudpickle.loads(first_responses[1].result.dump)
+                first_thread = next(
+                    thread
+                    for thread in threading.enumerate()
+                    if thread.name == first_thread_name
+                )
+
+                worker_loop = _idle_retirement_probe_loops[key]
+
+                def block_worker_thread():
+                    block_started.set()
+                    release_block.wait()
+
+                worker_loop.call_soon_threadsafe(block_worker_thread)
+                assert await loop.run_in_executor(None, block_started.wait, 5)
+                await asyncio.sleep(ttl + 0.1)
+
+                started = loop.time()
+                async with asyncio.timeout(2.0):
+                    second = stub.dispatch()
+                    await second.write(
+                        protocol.Request(
+                            task=make_task(_worker_loop_identity_probe).to_protobuf()
+                        )
+                    )
+                    await second.done_writing()
+                    second_responses = [response async for response in second]
+                elapsed = loop.time() - started
+
+            assert second_responses[0].HasField("ack")
+            _, _, second_thread_name = cloudpickle.loads(second_responses[1].result.dump)
+            assert second_thread_name != first_thread_name
+            assert elapsed < 1.0
+            assert any(
+                "Worker-loop thread did not stop" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            release_block.set()
+            _idle_retirement_probe_loops.pop(key, None)
+            if first_thread is not None:
+                await loop.run_in_executor(None, first_thread.join, 5)
+                assert not first_thread.is_alive()
+
+    @pytest.mark.asyncio
+    async def test_stop_should_bound_idle_retirement_for_blocked_worker(
+        self, grpc_aio_stub, mocker: MockerFixture, mock_worker_proxy_cache, caplog
+    ):
+        """A stop request arriving during idle retirement shares its finite bound."""
+        ttl = 0.1
+        mocker.patch.object(service_module, "_WORKER_LOOP_TTL", ttl)
+        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+        mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
+        key = uuid4().hex
+        service = WorkerService()
+        loop = asyncio.get_running_loop()
+        block_started = threading.Event()
+        release_block = threading.Event()
+        join_started = threading.Event()
+        joined_timeouts: list[float | None] = []
+        worker_thread: threading.Thread | None = None
+        original_join = threading.Thread.join
+
+        try:
+            async with grpc_aio_stub(servicer=service) as stub:
+                dispatch = stub.dispatch()
+                await dispatch.write(
+                    protocol.Request(
+                        task=make_task(
+                            _idle_retirement_worker_loop_probe, args=(key,)
+                        ).to_protobuf()
+                    )
+                )
+                await dispatch.done_writing()
+                responses = [response async for response in dispatch]
+                assert responses[0].HasField("ack")
+                worker_thread_name = cloudpickle.loads(responses[1].result.dump)
+                worker_thread = next(
+                    thread
+                    for thread in threading.enumerate()
+                    if thread.name == worker_thread_name
+                )
+
+                worker_loop = _idle_retirement_probe_loops[key]
+
+                def block_worker_thread():
+                    block_started.set()
+                    release_block.wait()
+
+                worker_loop.call_soon_threadsafe(block_worker_thread)
+                assert await loop.run_in_executor(None, block_started.wait, 5)
+
+                clear_count = (
+                    1
+                    + (wool.__proxy_pool__.get() is not None)
+                    + (__subscriber_pool__.get() is not None)
+                )
+                retirement_bound = (
+                    service_module._DRAIN_TIMEOUT
+                    + clear_count * service_module._CLEAR_FLOOR
+                )
+
+                def observe_join(thread: threading.Thread, timeout=None):
+                    if thread is worker_thread:
+                        joined_timeouts.append(timeout)
+                        join_started.set()
+                    return original_join(thread, timeout)
+
+                mocker.patch.object(threading.Thread, "join", observe_join)
+                assert await loop.run_in_executor(None, join_started.wait, 5)
+
+                started = loop.time()
+                with caplog.at_level(
+                    logging.WARNING, logger="wool.runtime.worker.service"
+                ):
+                    stop_result = await asyncio.wait_for(
+                        stub.stop(protocol.StopRequest(timeout=-1)),
+                        timeout=retirement_bound + 1.0,
+                    )
+                elapsed = loop.time() - started
+
+            assert isinstance(stop_result, protocol.Void)
+            assert service.stopped.is_set()
+            assert joined_timeouts[0] == pytest.approx(retirement_bound)
+            assert elapsed <= retirement_bound + 0.25
+            assert any(
+                "Worker-loop thread did not stop" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            release_block.set()
+            _idle_retirement_probe_loops.pop(key, None)
+            if worker_thread is not None:
+                await loop.run_in_executor(None, original_join, worker_thread, 5)
+                assert not worker_thread.is_alive()
 
     @pytest.mark.asyncio
     async def test_stop_should_clear_proxy_pool_on_worker_loop_when_warm(
