@@ -57,13 +57,14 @@ one down on every call; recreating the loop per dispatch would add its
 setup/teardown to dispatch latency and strand cleanup callbacks
 scheduled on the torn-down loop. The TTL only bounds how long an
 *idle* loop lingers before automatic teardown; an explicit `stop`
-clears the pool immediately regardless of this value, so no daemon
-thread outlives the service. The 30s window is generous enough to span
-the gap between bursts of dispatches on a healthy worker while still
-reaping a loop that has gone quiet. Retiring the loop also finalizes
-the loop's partitions of the proxy and discovery-subscriber pools (see
-`WorkerService._destroy_worker_loop`), so a cached proxy is reused only
-while the worker loop stays warm."""
+retires the loop without waiting for this TTL; see
+`WorkerService._destroy_worker_loop` for how long that waits and what
+happens to a worker thread that does not exit. The 30s window is
+generous enough to span the gap between bursts of dispatches on a
+healthy worker while still reaping a loop that has gone quiet. Retiring
+the loop also finalizes the loop's partitions of the proxy and
+discovery-subscriber pools (see `WorkerService._destroy_worker_loop`),
+so a cached proxy is reused only while the worker loop stays warm."""
 
 
 # public
@@ -187,17 +188,9 @@ class WorkerService(protocol.WorkerServicer):
         # was never retrieved" hazards. The done-callback discards
         # the task once the cancel propagation has completed.
         self._cancel_propagators: set[asyncio.Task[None]] = set()
-        # Budget for the loop-teardown join, set by `_stop`
-        # from the StopRequest's ``timeout``. ``0`` means "do not
-        # synchronously wait" (worker thread closes its own loop
-        # after ``run_forever`` returns; ``daemon=True`` reaps it
-        # at process exit if not joined); positive bounds the
-        # wait; ``None`` means "wait indefinitely" — caller asked
-        # for unlimited graceful shutdown via a negative or
-        # missing StopRequest timeout. ``None`` is used only after
-        # an explicit stop request; idle retirement has a finite bound.
+        # Join budget `_stop` stashes from the StopRequest, read only once
+        # a stop is requested — see `_destroy_worker_loop`.
         self._stop_timeout: float | None = None
-        self._stop_requested = False
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -579,9 +572,10 @@ class WorkerService(protocol.WorkerServicer):
 
         ``request.timeout`` bounds two waits: the grace period in-flight
         tasks get before they are cancelled, and the wait for the worker
-        thread to exit. Worker-loop teardown runs on a separate
-        five-second budget that ``request.timeout`` does not extend, so
-        the call can return before the loop has closed.
+        thread to exit. A stop that arrives while an idle worker loop is
+        retiring instead waits out that retirement's bound, whatever
+        ``request.timeout`` is, and can return with the retiring thread
+        still running; see `_destroy_worker_loop`.
 
         :param request:
             The protobuf stop request containing the wait timeout.
@@ -692,15 +686,16 @@ class WorkerService(protocol.WorkerServicer):
         closes without ``Task was destroyed but it is pending!`` warnings;
         past it, the daemon-thread reap at process exit is the backstop.
 
-        Finally joins the worker thread for up to `_stop_timeout` seconds
-        when stop was requested. Idle retirement instead waits for the
-        drain budget plus one clear floor per pool. ``0`` does not wait
-        and ``None`` waits indefinitely only for an explicit stop request;
-        a thread still running at a finite bound is left to the daemon
-        reap at process exit and reported. With ``0``, the clears and the
-        drain run on the worker thread after this returns; each loop clears
-        its own partition, so that path cannot race a successor loop's
-        first use of the process-wide channel pool.
+        Finally joins the worker thread. Under a stop request the join
+        waits up to `_stop_timeout` seconds: ``0`` does not wait and
+        ``None`` waits indefinitely. Idle retirement, with no stop
+        requested, instead waits for `_DRAIN_TIMEOUT` plus one
+        `_CLEAR_FLOOR` per clear it runs, the teardown's worst case. A
+        thread still running at a positive bound is left to the daemon
+        reap at process exit and logged at warning level. With ``0``, the
+        clears and the drain run on the worker thread after this returns;
+        each loop clears its own partition, so that path cannot race a
+        successor loop's first use of the process-wide channel pool.
 
         The drain tolerates a peer on the loop, i.e., another task that
         cancels or awaits the loop's tasks. A peer's cancel neither raises
@@ -911,7 +906,7 @@ class WorkerService(protocol.WorkerServicer):
 
         timeout = (
             self._stop_timeout
-            if self._stop_requested
+            if self._stopping.is_set()
             else _DRAIN_TIMEOUT + len(clears) * _CLEAR_FLOOR
         )
         if timeout is None or timeout > 0:
@@ -973,15 +968,8 @@ class WorkerService(protocol.WorkerServicer):
         """Pre-empt in-flight work, then retire the worker loop and its pools."""
         if timeout is not None and timeout < 0:
             timeout = None
-        # Stash the StopRequest's timeout for the loop-teardown
-        # finalizer (read by `_destroy_worker_loop`) before
-        # any ``await`` so it is always set when ``_loop_pool.clear``
-        # later invokes the finalizer. ``timeout=0`` (the default)
-        # → don't synchronously join; positive → bound the join;
-        # ``None`` (caller sent negative or omitted) → wait
-        # indefinitely.
+        # Stash the timeout before any ``await`` so the finalizer sees it.
         self._stop_timeout = timeout
-        self._stop_requested = True
         self._stopping.set()
         await self._preempt(timeout=timeout)
         try:

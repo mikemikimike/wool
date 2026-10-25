@@ -682,11 +682,17 @@ class WorkerConnection:
             the stop request. ``None`` (the wire default of ``0``)
             cancels in-flight tasks immediately; a positive value
             waits that long for a graceful drain; a negative value
-            waits indefinitely.
+            waits indefinitely. It also bounds the worker-thread join
+            when the stop request retires the loop. If idle retirement
+            is already underway, stop instead waits for that retirement's
+            finite bound and can return with its daemon thread still
+            running.
         :param timeout:
             gRPC call deadline in seconds for the stop call. ``None``
-            applies no deadline. The worker drains for up to ``grace``
-            before responding, so a finite deadline must exceed it.
+            applies no deadline. A finite deadline must allow for the
+            in-flight grace period and worker-loop teardown; a stop that
+            arrives during idle retirement may wait for its independent
+            finite bound before responding.
         :raises TransientRpcError:
             If the worker returns a transient RPC error
             (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or
