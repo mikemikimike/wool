@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import pickle
 import threading
@@ -32,6 +33,8 @@ from wool.runtime.worker.session import DispatchSession
 from wool.runtime.worker.session import Rejected
 
 _log = logging.getLogger(__name__)
+
+_stop_teardown = contextvars.ContextVar("worker_stop_teardown", default=False)
 
 _DRAIN_TIMEOUT: Final[float] = 5.0
 """Wall-clock budget in seconds for worker-loop teardown, measured from
@@ -906,7 +909,7 @@ class WorkerService(protocol.WorkerServicer):
 
         timeout = (
             self._stop_timeout
-            if self._stopping.is_set()
+            if _stop_teardown.get()
             else _DRAIN_TIMEOUT + len(clears) * _CLEAR_FLOOR
         )
         if timeout is None or timeout > 0:
@@ -914,10 +917,12 @@ class WorkerService(protocol.WorkerServicer):
             # thread so the main loop keeps pumping while we wait.
             await asyncio.get_running_loop().run_in_executor(None, thread.join, timeout)
             if timeout is not None and thread.is_alive():
-                _log.warning(
-                    "Worker-loop thread did not stop within %.3fs after teardown; "
-                    "the daemon thread will be reaped at process exit.",
-                    timeout,
+                report = _log.debug if _stop_teardown.get() else _log.warning
+                report(
+                    f"Worker-loop thread {thread.name} still running "
+                    f"{timeout:.3f}s after its teardown was scheduled; "
+                    "leaving it to exit on its own or be reaped at process "
+                    "exit."
                 )
 
     @asynccontextmanager
@@ -975,7 +980,11 @@ class WorkerService(protocol.WorkerServicer):
         try:
             # The worker loop's partitions of the proxy and subscriber
             # pools go with it — see `_destroy_worker_loop`.
-            await self._loop_pool.clear()
+            token = _stop_teardown.set(True)
+            try:
+                await self._loop_pool.clear()
+            finally:
+                _stop_teardown.reset(token)
         finally:
             self._stopped.set()
 

@@ -59,7 +59,7 @@ def make_task(callable, *, args=(), kwargs=None, proxy_id="test-proxy-id"):
 # carried in the task's args so the worker-side routine can look up its
 # own event. Cross-loop/cross-thread safe (threading.Event); tests
 # populate and clear it around each use.
-_keyed_events: dict[str, threading.Event] = {}
+_keyed_events: dict[str, object] = {}
 
 
 class _KeyedTaskError(Exception):
@@ -573,9 +573,6 @@ class _WorkerThreadBlock:
         self.thread: threading.Thread | None = None
 
 
-_worker_thread_blocks: dict[str, _WorkerThreadBlock] = {}
-
-
 async def _leave_worker_thread_blocker(key: str) -> str:
     """Leave behind a task that wedges the worker thread once armed.
 
@@ -585,7 +582,8 @@ async def _leave_worker_thread_blocker(key: str) -> str:
     worker loop. Reports the worker thread's name. Defined at module
     level so cloudpickle can serialize the callable for dispatch.
     """
-    block = _worker_thread_blocks[key]
+    block = _keyed_events[key]
+    assert isinstance(block, _WorkerThreadBlock)
     thread = threading.current_thread()
     block.thread = thread
 
@@ -604,12 +602,13 @@ def worker_thread_block() -> Iterator[tuple[str, _WorkerThreadBlock]]:
     """Register a worker-thread blocker and release it during teardown."""
     key = uuid4().hex
     block = _WorkerThreadBlock()
-    _worker_thread_blocks[key] = block
+    _keyed_events[key] = block
     yield key, block
     block.released.set()
-    del _worker_thread_blocks[key]
+    del _keyed_events[key]
     if block.thread is not None:
         block.thread.join(5)
+        assert not block.thread.is_alive(), "worker thread did not exit after release"
 
 
 async def _channel_pool_probe():
@@ -2621,7 +2620,7 @@ class TestWorkerService:
         mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
         mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
         mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = 0.2 + 3 * 0.05
+        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
@@ -2653,8 +2652,7 @@ class TestWorkerService:
         assert second_thread_name != first_thread_name
         assert elapsed < retirement_bound + _GRPC_SLACK
         assert any(
-            record.levelno == logging.WARNING
-            and "Worker-loop thread did not stop" in record.getMessage()
+            record.levelno == logging.WARNING and "still running" in record.getMessage()
             for record in caplog.records
         )
 
@@ -2684,7 +2682,7 @@ class TestWorkerService:
         mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
         mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
         mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = 0.2 + 3 * 0.05
+        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
@@ -2735,7 +2733,7 @@ class TestWorkerService:
         # the wait below.
         mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
         mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = 0.2 + 3 * 0.05
+        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
