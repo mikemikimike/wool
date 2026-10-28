@@ -2620,7 +2620,7 @@ class TestWorkerService:
         mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
         mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
         mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = service_module._idle_retirement_join_timeout(2)
+        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
@@ -2651,6 +2651,8 @@ class TestWorkerService:
         _, _, second_thread_name = cloudpickle.loads(second_result.result.dump)
         assert second_thread_name != first_thread_name
         assert elapsed < retirement_bound + _GRPC_SLACK
+        assert block.thread is not None
+        assert block.thread.daemon and block.thread.is_alive()
         assert any(
             record.levelno == logging.WARNING and "still running" in record.getMessage()
             for record in caplog.records
@@ -2682,7 +2684,7 @@ class TestWorkerService:
         mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
         mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
         mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = service_module._idle_retirement_join_timeout(2)
+        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
@@ -2710,19 +2712,21 @@ class TestWorkerService:
         assert elapsed < retirement_bound + _GRPC_SLACK
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("request_timeout", [0, 0.2])
     async def test_stop_should_return_within_request_timeout_when_worker_thread_blocked(
         self,
         grpc_aio_stub,
         mock_worker_proxy_cache,
         worker_thread_block,
+        request_timeout,
     ):
-        """Test `WorkerService.stop` honors a positive timeout on a blocked thread.
+        """Test `WorkerService.stop` honors zero and positive timeouts on a blocked thread.
 
         Given:
             A warm worker loop whose daemon thread is blocked by a task a
             routine left behind, with no idle retirement in flight
         When:
-            The stop RPC is invoked with a positive timeout
+            The stop RPC is invoked with a zero or positive timeout
         Then:
             It should return within that timeout with the service stopped
         """
@@ -2743,14 +2747,14 @@ class TestWorkerService:
             # Act
             started = loop.time()
             stop_result = await asyncio.wait_for(
-                stub.stop(protocol.StopRequest(timeout=0.2)), timeout=10
+                stub.stop(protocol.StopRequest(timeout=request_timeout)), timeout=10
             )
             elapsed = loop.time() - started
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
         assert service.stopped.is_set()
-        assert elapsed < 2 * 0.2 + _GRPC_SLACK
+        assert elapsed < (2 * request_timeout if request_timeout else 0.5) + _GRPC_SLACK
 
     @pytest.mark.asyncio
     async def test_stop_should_wait_for_blocked_worker_thread_when_timeout_negative(
@@ -2776,7 +2780,7 @@ class TestWorkerService:
         # the wait below.
         mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
         mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = service_module._idle_retirement_join_timeout(2)
+        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
