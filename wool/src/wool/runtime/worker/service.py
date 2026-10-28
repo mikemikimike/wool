@@ -51,6 +51,17 @@ and completion queues — a deadline that has already passed, and the
 channels are dropped unclosed instead. It bounds the teardown's worst
 case at the budget plus one floor per starved clear."""
 
+
+def _idle_retirement_join_timeout(clear_count: int) -> float:
+    """Return the join budget for an idle worker-loop retirement.
+
+    The drain deadline starts on the worker loop, while the thread join starts
+    on the service loop. One floor per clear provides the handoff slack between
+    those clocks and the loop's final stop/close callbacks.
+    """
+    return _DRAIN_TIMEOUT + clear_count * _CLEAR_FLOOR
+
+
 _WORKER_LOOP_TTL: Final[float] = 30.0
 """Idle time-to-live in seconds for the worker event-loop held by
 `WorkerService._loop_pool`. The loop pool is keyed by a single
@@ -910,7 +921,7 @@ class WorkerService(protocol.WorkerServicer):
         timeout = (
             self._stop_timeout
             if _stop_teardown.get()
-            else _DRAIN_TIMEOUT + len(clears) * _CLEAR_FLOOR
+            else _idle_retirement_join_timeout(len(clears))
         )
         if timeout is None or timeout > 0:
             # Offload the synchronous ``thread.join`` to a worker
