@@ -266,7 +266,7 @@ The `stop` RPC accepts a `timeout` argument that controls how in-flight tasks ar
 
 Signal handlers map `SIGTERM` to timeout 0 (cancel immediately) and `SIGINT` to timeout -1 (wait indefinitely).
 
-The same value controls the worker-thread join when the stop request retires the loop: `0` does not wait, a positive value bounds the wait, and a negative value waits indefinitely. If idle retirement has already started, stop waits for that retirement's finite bound instead, regardless of the request timeout, and can return while the retiring daemon thread is still running. See `WorkerService._destroy_worker_loop` for the bound and teardown behavior.
+The same value controls the worker-thread join when the stop request retires the loop: `0` does not wait, a positive value bounds the wait, and a negative value waits indefinitely. If idle retirement has already started, stop waits for that retirement's finite bound instead — a 5 s drain budget plus 0.5 s per pool cleared, at most ~6.5 s with the defaults — regardless of the request timeout, and can return while the retiring daemon thread is still running.
 
 ### Nested routines
 

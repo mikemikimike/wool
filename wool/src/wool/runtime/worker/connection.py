@@ -690,9 +690,10 @@ class WorkerConnection:
         :param timeout:
             gRPC call deadline in seconds for the stop call. ``None``
             applies no deadline. A finite deadline must allow for the
-            in-flight grace period and worker-loop teardown; a stop that
-            arrives during idle retirement may wait for its independent
-            finite bound before responding.
+            in-flight grace period and worker-loop teardown — a 5 s
+            drain budget plus 0.5 s per pool cleared, at most ~6.5 s
+            with the defaults; a stop that arrives during idle
+            retirement may wait for that bound before responding.
         :raises TransientRpcError:
             If the worker returns a transient RPC error
             (``UNAVAILABLE``, ``DEADLINE_EXCEEDED``, or
