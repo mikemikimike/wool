@@ -20,17 +20,23 @@ from wool.runtime.worker.base import Worker
 from wool.runtime.worker.base import WorkerOptions
 from wool.runtime.worker.connection import WorkerConnection
 from wool.runtime.worker.process import WorkerProcess
+from wool.runtime.worker.service import _CLEAR_FLOOR
+from wool.runtime.worker.service import _DRAIN_TIMEOUT
 
 if TYPE_CHECKING:
     from wool.runtime.worker.service import BackpressureLike
 
-_STOP_RPC_MARGIN: Final[float] = 5.0
-"""Seconds added to a finite stop timeout to form the graceful stop
-RPC's deadline. The worker drains in-flight tasks for up to the full
-stop timeout before responding, so the deadline must exceed it; the
-margin covers transport and response overhead. Without a deadline, a
-wedged worker would hang ``stop()`` forever and the force-terminate
-fallback would never be reached."""
+_STOP_RPC_MARGIN: Final[float] = _DRAIN_TIMEOUT + 3 * _CLEAR_FLOOR + 1.0
+"""Seconds added beyond twice a finite stop timeout to form the graceful
+stop RPC's deadline. ``StopRequest.timeout`` bounds two sequential waits
+on the worker — the in-flight drain and the worker-thread join — so the
+deadline budgets the stop timeout twice. A stop that lands while an idle
+retirement is in flight instead waits out that retirement's bound: the
+drain budget plus one clear floor for each of the worker's three pools
+(proxy, subscriber, channel), the teardown's worst case, which this
+margin covers together with one second of transport and response
+overhead. Without a deadline, a wedged worker would hang ``stop()``
+forever and the force-terminate fallback would never be reached."""
 
 
 # public
@@ -226,12 +232,12 @@ class LocalWorker(Worker):
                     # Only a bounded drain (positive grace) admits a
                     # finite deadline; a negative grace drains
                     # indefinitely, and ``None`` keeps the pre-existing
-                    # unbounded call. See `_STOP_RPC_MARGIN` for the
-                    # finite deadline.
+                    # unbounded call. The grace is budgeted twice — see
+                    # `_STOP_RPC_MARGIN`.
                     if grace is None or grace < 0:
                         deadline = None
                     else:
-                        deadline = grace + _STOP_RPC_MARGIN
+                        deadline = 2 * grace + _STOP_RPC_MARGIN
                     await connection.stop(grace=grace, timeout=deadline)
         finally:
             # `reap` blocks on `join`, so it must run off-loop — see
