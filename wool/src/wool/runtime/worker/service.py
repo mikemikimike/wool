@@ -705,7 +705,9 @@ class WorkerService(protocol.WorkerServicer):
         requested, instead waits for `_DRAIN_TIMEOUT` plus one
         `_CLEAR_FLOOR` per clear it runs, the teardown's worst case. A
         thread still running at a positive bound is left to the daemon
-        reap at process exit and logged at warning level. With ``0``, the
+        reap at process exit, reported at warning level for an idle
+        retirement and at debug under a stop request, whose caller chose
+        the bound it outlived. With ``0``, the
         clears and the drain run on the worker thread after this returns;
         each loop clears its own partition, so that path cannot race a
         successor loop's first use of the process-wide channel pool.
