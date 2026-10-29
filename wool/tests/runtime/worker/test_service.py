@@ -597,6 +597,23 @@ async def _leave_worker_thread_blocker(key: str) -> str:
     return thread.name
 
 
+async def _wedge_worker_thread(stub, key: str, block: _WorkerThreadBlock) -> str:
+    """Dispatch the blocker task over ``stub``, arm it, and await entry.
+
+    Returns the worker thread name the blocker reported; on return the
+    worker thread is wedged inside the planted task until ``released``.
+    """
+    blocker = make_task(_leave_worker_thread_blocker, args=(key,))
+    dispatch = stub.dispatch()
+    await dispatch.write(protocol.Request(task=blocker.to_protobuf()))
+    await dispatch.done_writing()
+    _, result = [response async for response in dispatch]
+    block.armed.set()
+    loop = asyncio.get_running_loop()
+    assert await loop.run_in_executor(None, block.entered.wait, 5)
+    return cloudpickle.loads(result.result.dump)
+
+
 @pytest.fixture
 def worker_thread_block() -> Iterator[tuple[str, _WorkerThreadBlock]]:
     """Register a worker-thread blocker and release it during teardown."""
@@ -609,6 +626,21 @@ def worker_thread_block() -> Iterator[tuple[str, _WorkerThreadBlock]]:
     if block.thread is not None:
         block.thread.join(5)
         assert not block.thread.is_alive(), "worker thread did not exit after release"
+
+
+@pytest.fixture
+def retirement_budget(mocker: MockerFixture) -> float:
+    """Patch the teardown budgets small and return the retirement bound.
+
+    No public knob exposes the drain budget or the per-clear floor, so
+    the tests patch them to keep the retirement bound short. The bound
+    is the drain budget plus one floor for each clear the teardown
+    runs — proxy and channel here, since the tests install only the
+    proxy pool and leave the subscriber pool unset.
+    """
+    mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
+    mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
+    return 0.2 + 2 * 0.05
 
 
 async def _channel_pool_probe():
@@ -2599,6 +2631,7 @@ class TestWorkerService:
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         worker_thread_block,
+        retirement_budget,
         caplog,
     ):
         """Test `WorkerService.dispatch` is not held by blocked retirement.
@@ -2613,28 +2646,16 @@ class TestWorkerService:
             bound and warn that the blocked thread was left to the
             daemon reap
         """
-        # Arrange — no public knob exposes the idle TTL, the drain budget
-        # or the per-clear floor, so patch them to keep the retirement
-        # bound short: the drain budget plus one floor for each of the
-        # proxy, subscriber and channel clears.
+        # Arrange — no public knob exposes the idle TTL either; see
+        # `retirement_budget` for the patched teardown budgets.
         mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
-        mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
-        blocker = make_task(_leave_worker_thread_blocker, args=(key,))
         probe = make_task(_worker_loop_identity_probe)
 
         async with grpc_aio_stub(servicer=service) as stub:
-            first = stub.dispatch()
-            await first.write(protocol.Request(task=blocker.to_protobuf()))
-            await first.done_writing()
-            _, first_result = [response async for response in first]
-            first_thread_name = cloudpickle.loads(first_result.result.dump)
-            block.armed.set()
-            assert await loop.run_in_executor(None, block.entered.wait, 5)
+            first_thread_name = await _wedge_worker_thread(stub, key, block)
             await asyncio.sleep(0.8 + 0.1)
 
             # Act
@@ -2650,7 +2671,7 @@ class TestWorkerService:
         # Assert
         _, _, second_thread_name = cloudpickle.loads(second_result.result.dump)
         assert second_thread_name != first_thread_name
-        assert elapsed < retirement_bound + _GRPC_SLACK
+        assert elapsed < retirement_budget + _GRPC_SLACK
         assert block.thread is not None
         assert block.thread.daemon and block.thread.is_alive()
         assert any(
@@ -2665,6 +2686,7 @@ class TestWorkerService:
         mocker: MockerFixture,
         mock_worker_proxy_cache,
         worker_thread_block,
+        retirement_budget,
     ):
         """Test `WorkerService.stop` returns within idle retirement's bound.
 
@@ -2677,26 +2699,15 @@ class TestWorkerService:
             It should return within the retirement bound with the
             service stopped
         """
-        # Arrange — no public knob exposes the idle TTL, the drain budget
-        # or the per-clear floor, so patch them to keep the retirement
-        # bound short: the drain budget plus one floor for each of the
-        # proxy, subscriber and channel clears.
+        # Arrange — no public knob exposes the idle TTL either; see
+        # `retirement_budget` for the patched teardown budgets.
         mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
-        mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = 0.2 + 2 * 0.05
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
-        blocker = make_task(_leave_worker_thread_blocker, args=(key,))
 
         async with grpc_aio_stub(servicer=service) as stub:
-            dispatch = stub.dispatch()
-            await dispatch.write(protocol.Request(task=blocker.to_protobuf()))
-            await dispatch.done_writing()
-            _ = [response async for response in dispatch]
-            block.armed.set()
-            assert await loop.run_in_executor(None, block.entered.wait, 5)
+            await _wedge_worker_thread(stub, key, block)
             await asyncio.sleep(0.8 + 0.1)
 
             # Act
@@ -2709,7 +2720,7 @@ class TestWorkerService:
         # Assert
         assert isinstance(stop_result, protocol.Void)
         assert service.stopped.is_set()
-        assert elapsed < retirement_bound + _GRPC_SLACK
+        assert elapsed < retirement_budget + _GRPC_SLACK
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("request_timeout", [0, 0.2])
@@ -2720,7 +2731,7 @@ class TestWorkerService:
         worker_thread_block,
         request_timeout,
     ):
-        """Test `WorkerService.stop` honors zero and positive timeouts on a blocked thread.
+        """Test `WorkerService.stop` honors bounded timeouts on a blocked thread.
 
         Given:
             A warm worker loop whose daemon thread is blocked by a task a
@@ -2734,15 +2745,9 @@ class TestWorkerService:
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
-        blocker = make_task(_leave_worker_thread_blocker, args=(key,))
 
         async with grpc_aio_stub(servicer=service) as stub:
-            dispatch = stub.dispatch()
-            await dispatch.write(protocol.Request(task=blocker.to_protobuf()))
-            await dispatch.done_writing()
-            _ = [response async for response in dispatch]
-            block.armed.set()
-            assert await loop.run_in_executor(None, block.entered.wait, 5)
+            await _wedge_worker_thread(stub, key, block)
 
             # Act
             started = loop.time()
@@ -2760,9 +2765,9 @@ class TestWorkerService:
     async def test_stop_should_wait_for_blocked_worker_thread_when_timeout_negative(
         self,
         grpc_aio_stub,
-        mocker: MockerFixture,
         mock_worker_proxy_cache,
         worker_thread_block,
+        retirement_budget,
     ):
         """Test `WorkerService.stop` waits for a blocked worker thread.
 
@@ -2774,29 +2779,18 @@ class TestWorkerService:
         Then:
             It should not return until the worker thread is released
         """
-        # Arrange — no public knob exposes the drain budget or the
-        # per-clear floor, so patch them to keep the retirement bound
-        # short; a stop that wrongly applied it would return well within
-        # the wait below.
-        mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
-        mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-        retirement_bound = 0.2 + 2 * 0.05
+        # Arrange — `retirement_budget` keeps the bound short; a stop
+        # that wrongly applied it would return well within the wait
+        # below.
         key, block = worker_thread_block
-        loop = asyncio.get_running_loop()
         service = WorkerService()
-        blocker = make_task(_leave_worker_thread_blocker, args=(key,))
 
         async with grpc_aio_stub(servicer=service) as stub:
-            dispatch = stub.dispatch()
-            await dispatch.write(protocol.Request(task=blocker.to_protobuf()))
-            await dispatch.done_writing()
-            _ = [response async for response in dispatch]
-            block.armed.set()
-            assert await loop.run_in_executor(None, block.entered.wait, 5)
+            await _wedge_worker_thread(stub, key, block)
 
             # Act
             stop = asyncio.ensure_future(stub.stop(protocol.StopRequest(timeout=-1)))
-            await asyncio.sleep(retirement_bound + _GRPC_SLACK)
+            await asyncio.sleep(retirement_budget + _GRPC_SLACK)
             pending_while_blocked = not stop.done()
             block.released.set()
             stop_result = await asyncio.wait_for(stop, timeout=5)
