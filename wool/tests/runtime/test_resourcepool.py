@@ -9,6 +9,7 @@ departure so it is not re-raised.
 
 import asyncio
 import contextlib
+import contextvars
 import gc
 import inspect
 import logging
@@ -401,6 +402,80 @@ def counting_factory():
 
 
 class TestResourcePool:
+    @pytest.mark.asyncio
+    async def test_clear_should_run_finalizers_in_the_calling_tasks_context(self):
+        """Test `ResourcePool.clear` runs finalizers in the caller's context.
+
+        Given:
+            A pool with a cached entry and a finalizer that reads a
+            context variable
+        When:
+            The variable is set around a call to clear
+        Then:
+            It should be visible inside the finalizer
+        """
+        # Arrange
+        seen: list[str] = []
+        marker: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "clear_marker", default="unset"
+        )
+
+        def finalizer(obj):
+            seen.append(marker.get())
+
+        pool = ResourcePool(factory=lambda key: object(), finalizer=finalizer, ttl=60)
+        async with pool.get("key"):
+            pass
+
+        # Act
+        token = marker.set("stop")
+        try:
+            await pool.clear()
+        finally:
+            marker.reset(token)
+
+        # Assert
+        assert seen == ["stop"]
+
+    @pytest.mark.asyncio
+    async def test_ttl_cleanup_should_run_finalizer_in_the_arm_time_context(self):
+        """Test a TTL-expired entry's finalizer sees the arm-time context.
+
+        Given:
+            A pool entry released while a context variable is set,
+            arming the expiry timer in that context
+        When:
+            The TTL elapses after the variable has been reset
+        Then:
+            The finalizer should observe the arm-time value rather than
+            the later one
+        """
+        # Arrange
+        seen: list[str] = []
+        finalized = asyncio.Event()
+        marker: contextvars.ContextVar[str] = contextvars.ContextVar(
+            "ttl_marker", default="unset"
+        )
+
+        def finalizer(obj):
+            seen.append(marker.get())
+            finalized.set()
+
+        pool = ResourcePool(factory=lambda key: object(), finalizer=finalizer, ttl=0.05)
+        token = marker.set("armed")
+        try:
+            async with pool.get("key"):
+                pass
+        finally:
+            marker.reset(token)
+
+        # Act — wait on the cleanup's own signal rather than sleeping past it
+        async with asyncio.timeout(5):
+            await finalized.wait()
+
+        # Assert
+        assert seen == ["armed"]
+
     @pytest.mark.asyncio
     @settings(max_examples=50, deadline=None)
     @example(ttl=0.0)

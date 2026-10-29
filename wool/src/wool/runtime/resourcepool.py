@@ -277,7 +277,14 @@ class ResourcePool(Generic[T]):
         cancellation is reported the same way before the cancellation
         propagates, since the resource it was closing is evicted without
         having been closed. A failure inside a cleanup the TTL spawned
-        has no caller to propagate to and is reported likewise.
+        has no caller to propagate to and is reported likewise. A
+        finalizer executes in the ``contextvars`` context of the
+        operation that triggers it: inline on the task that calls
+        `clear`, `expire` or `expire_all`, and, for a cleanup the TTL
+        spawned, in the context captured when the expiry timer was
+        armed — never a later caller's. Callers may rely on this to
+        scope per-teardown state, e.g. a context variable set around a
+        `clear`.
     :param ttl:
         Time-to-live in seconds after last reference is released.
     """
@@ -480,7 +487,10 @@ class ResourcePool(Generic[T]):
 
         A release that was finalizing an entry when the clear began is
         awaited before the sweep starts, so an unbounded teardown drives
-        it to completion rather than leaving it for a stopping loop.
+        it to completion rather than leaving it for a stopping loop. The
+        sweep runs each finalizer inline on the calling task, in its
+        ``contextvars`` context — the `finalizer` contract callers scope
+        per-teardown state with.
 
         :param deadline:
             When the sweep must be done, on the running loop's clock
