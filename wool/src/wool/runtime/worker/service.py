@@ -34,7 +34,14 @@ from wool.runtime.worker.session import Rejected
 
 _log = logging.getLogger(__name__)
 
-_stop_teardown = contextvars.ContextVar("worker_stop_teardown", default=False)
+_stop_budget: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "worker_stop_budget"
+)
+"""Join budget for a stop-driven worker-loop teardown, set by
+`WorkerService._stop` around its pool clear so only the finalizers that
+clear runs inherit it: the mapped ``StopRequest.timeout``, with ``None``
+meaning an unbounded join. Unset outside a stop, where idle retirement
+computes its own bound — see `WorkerService._destroy_worker_loop`."""
 
 _DRAIN_TIMEOUT: Final[float] = 5.0
 """Wall-clock budget in seconds for worker-loop teardown, measured from
@@ -202,9 +209,6 @@ class WorkerService(protocol.WorkerServicer):
         # was never retrieved" hazards. The done-callback discards
         # the task once the cancel propagation has completed.
         self._cancel_propagators: set[asyncio.Task[None]] = set()
-        # Join budget `_stop` stashes from the StopRequest, read only once
-        # a stop is requested — see `_destroy_worker_loop`.
-        self._stop_timeout: float | None = None
         self._loop_pool = ResourcePool(
             factory=self._create_worker_loop,
             finalizer=self._destroy_worker_loop,
@@ -701,7 +705,7 @@ class WorkerService(protocol.WorkerServicer):
         past it, the daemon-thread reap at process exit is the backstop.
 
         Finally joins the worker thread. Under a stop request the join
-        waits up to `_stop_timeout` seconds: ``0`` does not wait and
+        waits up to the request's mapped timeout: ``0`` does not wait and
         ``None`` waits indefinitely. Idle retirement, with no stop
         requested, instead waits for `_DRAIN_TIMEOUT` plus one
         `_CLEAR_FLOOR` per clear it runs, the teardown's worst case. A
@@ -918,17 +922,20 @@ class WorkerService(protocol.WorkerServicer):
             # via the ``_run_then_close`` finally clause.
             return
 
-        timeout = (
-            self._stop_timeout
-            if _stop_teardown.get()
-            else _idle_retirement_join_timeout(len(clears))
-        )
+        try:
+            # A stop's own clear carries its budget; outside that scope
+            # idle retirement computes its bound from the clears it runs.
+            timeout = _stop_budget.get()
+            stop_requested = True
+        except LookupError:
+            timeout = _idle_retirement_join_timeout(len(clears))
+            stop_requested = False
         if timeout is None or timeout > 0:
             # Offload the synchronous ``thread.join`` to a worker
             # thread so the main loop keeps pumping while we wait.
             await asyncio.get_running_loop().run_in_executor(None, thread.join, timeout)
             if timeout is not None and thread.is_alive():
-                report = _log.debug if _stop_teardown.get() else _log.warning
+                report = _log.debug if stop_requested else _log.warning
                 report(
                     f"Worker-loop thread {thread.name} still running "
                     f"{timeout:.3f}s after its teardown was scheduled; "
@@ -984,18 +991,16 @@ class WorkerService(protocol.WorkerServicer):
         """Pre-empt in-flight work, then retire the worker loop and its pools."""
         if timeout is not None and timeout < 0:
             timeout = None
-        # Stash the timeout before any ``await`` so the finalizer sees it.
-        self._stop_timeout = timeout
         self._stopping.set()
         await self._preempt(timeout=timeout)
         try:
             # The worker loop's partitions of the proxy and subscriber
             # pools go with it — see `_destroy_worker_loop`.
-            token = _stop_teardown.set(True)
+            token = _stop_budget.set(timeout)
             try:
                 await self._loop_pool.clear()
             finally:
-                _stop_teardown.reset(token)
+                _stop_budget.reset(token)
         finally:
             self._stopped.set()
 
