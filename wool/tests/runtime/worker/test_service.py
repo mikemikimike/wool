@@ -53,13 +53,14 @@ def make_task(callable, *, args=(), kwargs=None, proxy_id="test-proxy-id"):
     )
 
 
-# Registry of per-task control events for tests that need several
+# Registry of per-task control objects for tests that need several
 # independently-releasable in-flight tasks (the single global
 # `_control_event` below only drives one). Keyed by an opaque token
 # carried in the task's args so the worker-side routine can look up its
-# own event. Cross-loop/cross-thread safe (threading.Event); tests
-# populate and clear it around each use.
-_keyed_events: dict[str, object] = {}
+# own entry. Values are plain events or `_WorkerThreadBlock` bundles,
+# both cross-loop/cross-thread safe; tests populate and clear the
+# registry around each use.
+_keyed_events: dict[str, "threading.Event | _WorkerThreadBlock"] = {}
 
 
 class _KeyedTaskError(Exception):
