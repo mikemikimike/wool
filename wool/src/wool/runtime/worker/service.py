@@ -599,7 +599,8 @@ class WorkerService(protocol.WorkerServicer):
 
         .. rubric:: Implementation notes
 
-        Teardown is `_destroy_worker_loop`, bounded by `_DRAIN_TIMEOUT`.
+        Teardown is `_destroy_worker_loop`; see it for the bounds it
+        enforces.
         """
         if self._stopping.is_set():
             return protocol.Void()
