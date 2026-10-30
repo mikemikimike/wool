@@ -6,6 +6,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import AsyncExitStack
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from functools import partial
 from uuid import uuid4
 
@@ -613,6 +614,37 @@ async def _wedge_worker_thread(stub, key: str, block: _WorkerThreadBlock) -> str
     loop = asyncio.get_running_loop()
     assert await loop.run_in_executor(None, block.entered.wait, 5)
     return cloudpickle.loads(result.result.dump)
+
+
+@contextmanager
+def _join_overrun_warning() -> Iterator[asyncio.Event]:
+    """Yield an event set when the join-overrun warning is logged.
+
+    Attaches a handler to the service logger for the scope and sets the
+    yielded event on the first WARNING-level "still running" record, so
+    a test can await the overrun report instead of sleeping out the
+    bound that produces it.
+    """
+
+    class _Signal(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.logged = asyncio.Event()
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if (
+                record.levelno == logging.WARNING
+                and "still running" in record.getMessage()
+            ):
+                self.logged.set()
+
+    handler = _Signal()
+    logger = logging.getLogger("wool.runtime.worker.service")
+    logger.addHandler(handler)
+    try:
+        yield handler.logged
+    finally:
+        logger.removeHandler(handler)
 
 
 @pytest.fixture
@@ -2748,21 +2780,6 @@ class TestWorkerService:
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService(worker_loop_ttl=ttl, **budget_kwargs)
-        overrun_logged = asyncio.Event()
-
-        class _OverrunSignal(logging.Handler):
-            """Set ``overrun_logged`` when the join-overrun record lands."""
-
-            def emit(self, record: logging.LogRecord) -> None:
-                if (
-                    record.levelno == logging.WARNING
-                    and "still running" in record.getMessage()
-                ):
-                    overrun_logged.set()
-
-        handler = _OverrunSignal()
-        service_logger = logging.getLogger("wool.runtime.worker.service")
-        service_logger.addHandler(handler)
 
         async with grpc_aio_stub(servicer=service) as stub:
             await _wedge_worker_thread(stub, key, block)
@@ -2776,8 +2793,11 @@ class TestWorkerService:
             service._docket.add(sentinel)
             try:
                 # Act
-                with caplog.at_level(
-                    logging.WARNING, logger="wool.runtime.worker.service"
+                with (
+                    caplog.at_level(
+                        logging.WARNING, logger="wool.runtime.worker.service"
+                    ),
+                    _join_overrun_warning() as overrun_logged,
                 ):
                     stop = asyncio.ensure_future(
                         stub.stop(protocol.StopRequest(timeout=30))
@@ -2788,7 +2808,6 @@ class TestWorkerService:
                     elapsed = loop.time() - started
             finally:
                 service._docket.discard(sentinel)
-                service_logger.removeHandler(handler)
             stop_result = await asyncio.wait_for(stop, timeout=5)
 
         # Assert
