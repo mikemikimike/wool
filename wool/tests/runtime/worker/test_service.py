@@ -2663,7 +2663,6 @@ class TestWorkerService:
         mock_worker_proxy_cache,
         worker_thread_block,
         retirement_budget,
-        caplog,
     ):
         """Test `WorkerService.dispatch` is not held by blocked retirement.
 
@@ -2674,8 +2673,7 @@ class TestWorkerService:
             Another dispatch arrives
         Then:
             It should run on a new worker thread within the retirement
-            bound and warn that the blocked thread was left to the
-            daemon reap
+            bound
         """
         # Arrange — a short TTL and the fixture's teardown budgets keep
         # the retirement quick.
@@ -2690,19 +2688,58 @@ class TestWorkerService:
             await asyncio.sleep(0.8 + 0.1)
 
             # Act
-            with caplog.at_level(logging.WARNING, logger="wool.runtime.worker.service"):
-                started = loop.time()
-                async with asyncio.timeout(5):
-                    second = stub.dispatch()
-                    await second.write(protocol.Request(task=probe.to_protobuf()))
-                    await second.done_writing()
-                    _, second_result = [response async for response in second]
-                elapsed = loop.time() - started
+            started = loop.time()
+            async with asyncio.timeout(5):
+                second = stub.dispatch()
+                await second.write(protocol.Request(task=probe.to_protobuf()))
+                await second.done_writing()
+                _, second_result = [response async for response in second]
+            elapsed = loop.time() - started
 
         # Assert
         _, _, second_thread_name = cloudpickle.loads(second_result.result.dump)
         assert second_thread_name != first_thread_name
         assert elapsed < retirement_bound + _GRPC_SLACK
+
+    @pytest.mark.asyncio
+    async def test_dispatch_should_warn_when_retired_thread_outlives_budget(
+        self,
+        grpc_aio_stub,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        retirement_budget,
+        caplog,
+    ):
+        """Test `WorkerService.dispatch` leaves a blocked thread to the daemon reap.
+
+        Given:
+            A worker loop whose daemon thread is blocked by a task a
+            routine left behind
+        When:
+            The loop's idle TTL expires and the retirement's join
+            outlives the retirement bound
+        Then:
+            It should warn that the thread was left running and leave it
+            alive as a daemon for the process-exit reap
+        """
+        # Arrange
+        budget_kwargs, _ = retirement_budget
+        key, block = worker_thread_block
+        service = WorkerService(worker_loop_ttl=0.3, **budget_kwargs)
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            with (
+                caplog.at_level(logging.WARNING, logger="wool.runtime.worker.service"),
+                _join_overrun_warning() as overrun_logged,
+            ):
+                await _wedge_worker_thread(stub, key, block)
+
+                # Act — the TTL retirement runs on its own; await its
+                # overrun report rather than sleeping out the bound.
+                async with asyncio.timeout(5):
+                    await overrun_logged.wait()
+
+        # Assert
         assert block.thread is not None
         assert block.thread.daemon and block.thread.is_alive()
         assert any(
