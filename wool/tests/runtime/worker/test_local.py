@@ -495,6 +495,12 @@ class TestLocalWorker:
         assert deadline > grace + (
             service_module._DRAIN_TIMEOUT + 3 * service_module._MIN_CLEAR_TIMEOUT
         )
+        # Draw-independent: the margin itself must exceed the worst-case
+        # idle retirement, whatever grace Hypothesis drew, which pins the
+        # transport-and-response term the inequality above can absorb.
+        assert local_module.STOP_RPC_MARGIN > (
+            service_module._DRAIN_TIMEOUT + 3 * service_module._MIN_CLEAR_TIMEOUT
+        )
         mock_process.reap.assert_called_once_with(grace)
 
     @pytest.mark.asyncio
