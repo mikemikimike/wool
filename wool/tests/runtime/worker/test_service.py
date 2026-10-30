@@ -2721,6 +2721,86 @@ class TestWorkerService:
         assert elapsed < retirement_bound + _GRPC_SLACK
 
     @pytest.mark.asyncio
+    async def test_stop_should_not_bound_concurrent_idle_retirement_when_draining(
+        self,
+        grpc_aio_stub,
+        mocker: MockerFixture,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        retirement_budget,
+        caplog,
+    ):
+        """Test `WorkerService.stop` leaves an overlapping idle retirement its budget.
+
+        Given:
+            A worker loop whose idle TTL fires while a stop request with
+            a positive grace is still draining in-flight work, and whose
+            daemon thread is blocked by a task a routine left behind
+        When:
+            The TTL retirement's teardown joins the blocked thread
+        Then:
+            It should join on the idle retirement bound and report the
+            overrun at warning level, despite the concurrent stop
+        """
+        # Arrange
+        budget_kwargs, retirement_bound = retirement_budget
+        ttl = 0.3
+        key, block = worker_thread_block
+        loop = asyncio.get_running_loop()
+        service = WorkerService(worker_loop_ttl=ttl, **budget_kwargs)
+        overrun_logged = asyncio.Event()
+
+        class _OverrunSignal(logging.Handler):
+            """Set ``overrun_logged`` when the join-overrun record lands."""
+
+            def emit(self, record: logging.LogRecord) -> None:
+                if (
+                    record.levelno == logging.WARNING
+                    and "still running" in record.getMessage()
+                ):
+                    overrun_logged.set()
+
+        handler = _OverrunSignal()
+        service_logger = logging.getLogger("wool.runtime.worker.service")
+        service_logger.addHandler(handler)
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            await _wedge_worker_thread(stub, key, block)
+            # The blocker dispatch has completed, so the loop-pool entry
+            # is released and the TTL is armed; a real second dispatch
+            # would re-acquire the entry and disarm the timer. The
+            # sentinel stands in for in-flight work the stop's
+            # pre-emption keeps draining — the window in which the TTL
+            # provably fires after the stop signal is latched.
+            sentinel = mocker.Mock()
+            service._docket.add(sentinel)
+            try:
+                # Act
+                with caplog.at_level(
+                    logging.WARNING, logger="wool.runtime.worker.service"
+                ):
+                    stop = asyncio.ensure_future(
+                        stub.stop(protocol.StopRequest(timeout=30))
+                    )
+                    started = loop.time()
+                    async with asyncio.timeout(5):
+                        await overrun_logged.wait()
+                    elapsed = loop.time() - started
+            finally:
+                service._docket.discard(sentinel)
+                service_logger.removeHandler(handler)
+            stop_result = await asyncio.wait_for(stop, timeout=5)
+
+        # Assert
+        assert elapsed < ttl + retirement_bound + _GRPC_SLACK
+        assert isinstance(stop_result, protocol.Void)
+        assert service.stopped.is_set()
+        assert any(
+            record.levelno == logging.WARNING and "still running" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("request_timeout", [0, 0.2])
     async def test_stop_should_return_within_request_timeout_when_worker_thread_blocked(
         self,
