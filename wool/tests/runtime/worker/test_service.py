@@ -630,18 +630,17 @@ def worker_thread_block() -> Iterator[tuple[str, _WorkerThreadBlock]]:
 
 
 @pytest.fixture
-def retirement_budget(mocker: MockerFixture) -> float:
-    """Patch the teardown budgets small and return the retirement bound.
+def retirement_budget() -> tuple[dict[str, float], float]:
+    """Provide teardown-budget kwargs and the retirement bound they imply.
 
-    No public knob exposes the drain budget or the per-clear floor, so
-    the tests patch them to keep the retirement bound short. The bound
-    is the drain budget plus one floor for each clear the teardown
-    runs — proxy and channel here, since the tests install only the
-    proxy pool and leave the subscriber pool unset.
+    The kwargs configure a `WorkerService` with a short drain budget
+    and per-clear floor. The bound is the drain budget plus one floor
+    for each clear the teardown runs — proxy and channel here, since
+    the tests install only the proxy pool and leave the subscriber
+    pool unset.
     """
-    mocker.patch.object(service_module, "_DRAIN_TIMEOUT", 0.2)
-    mocker.patch.object(service_module, "_CLEAR_FLOOR", 0.05)
-    return 0.2 + 2 * 0.05
+    kwargs = {"drain_timeout": 0.2, "min_clear_timeout": 0.05}
+    return kwargs, 0.2 + 2 * 0.05
 
 
 async def _channel_pool_probe():
@@ -2629,7 +2628,6 @@ class TestWorkerService:
     async def test_dispatch_should_start_on_new_worker_loop_when_retired_thread_blocked(
         self,
         grpc_aio_stub,
-        mocker: MockerFixture,
         mock_worker_proxy_cache,
         worker_thread_block,
         retirement_budget,
@@ -2647,12 +2645,12 @@ class TestWorkerService:
             bound and warn that the blocked thread was left to the
             daemon reap
         """
-        # Arrange — no public knob exposes the idle TTL either; see
-        # `retirement_budget` for the patched teardown budgets.
-        mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
+        # Arrange — a short TTL and the fixture's teardown budgets keep
+        # the retirement quick.
+        budget_kwargs, retirement_bound = retirement_budget
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
-        service = WorkerService()
+        service = WorkerService(worker_loop_ttl=0.8, **budget_kwargs)
         probe = make_task(_worker_loop_identity_probe)
 
         async with grpc_aio_stub(servicer=service) as stub:
@@ -2672,7 +2670,7 @@ class TestWorkerService:
         # Assert
         _, _, second_thread_name = cloudpickle.loads(second_result.result.dump)
         assert second_thread_name != first_thread_name
-        assert elapsed < retirement_budget + _GRPC_SLACK
+        assert elapsed < retirement_bound + _GRPC_SLACK
         assert block.thread is not None
         assert block.thread.daemon and block.thread.is_alive()
         assert any(
@@ -2684,7 +2682,6 @@ class TestWorkerService:
     async def test_stop_should_return_within_retirement_bound_when_retirement_blocked(
         self,
         grpc_aio_stub,
-        mocker: MockerFixture,
         mock_worker_proxy_cache,
         worker_thread_block,
         retirement_budget,
@@ -2700,12 +2697,12 @@ class TestWorkerService:
             It should return within the retirement bound with the
             service stopped
         """
-        # Arrange — no public knob exposes the idle TTL either; see
-        # `retirement_budget` for the patched teardown budgets.
-        mocker.patch.object(service_module, "_WORKER_LOOP_TTL", 0.8)
+        # Arrange — a short TTL and the fixture's teardown budgets keep
+        # the retirement quick.
+        budget_kwargs, retirement_bound = retirement_budget
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
-        service = WorkerService()
+        service = WorkerService(worker_loop_ttl=0.8, **budget_kwargs)
 
         async with grpc_aio_stub(servicer=service) as stub:
             await _wedge_worker_thread(stub, key, block)
@@ -2721,7 +2718,7 @@ class TestWorkerService:
         # Assert
         assert isinstance(stop_result, protocol.Void)
         assert service.stopped.is_set()
-        assert elapsed < retirement_budget + _GRPC_SLACK
+        assert elapsed < retirement_bound + _GRPC_SLACK
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("request_timeout", [0, 0.2])
@@ -2795,18 +2792,19 @@ class TestWorkerService:
         Then:
             It should not return until the worker thread is released
         """
-        # Arrange — `retirement_budget` keeps the bound short; a stop
-        # that wrongly applied it would return well within the wait
-        # below.
+        # Arrange — the fixture's budgets keep the retirement bound
+        # short; a stop that wrongly applied it would return well
+        # within the wait below.
+        budget_kwargs, retirement_bound = retirement_budget
         key, block = worker_thread_block
-        service = WorkerService()
+        service = WorkerService(**budget_kwargs)
 
         async with grpc_aio_stub(servicer=service) as stub:
             await _wedge_worker_thread(stub, key, block)
 
             # Act
             stop = asyncio.ensure_future(stub.stop(protocol.StopRequest(timeout=-1)))
-            await asyncio.sleep(retirement_budget + _GRPC_SLACK)
+            await asyncio.sleep(retirement_bound + _GRPC_SLACK)
             pending_while_blocked = not stop.done()
             block.released.set()
             stop_result = await asyncio.wait_for(stop, timeout=5)
@@ -3269,11 +3267,11 @@ class TestWorkerService:
             clear that ran before it
         """
         # Arrange -- no public knob exposes the drain budget. The budget
-        # is set well clear of `_CLEAR_FLOOR` so the deadline asserted
+        # is set well clear of `_MIN_CLEAR_TIMEOUT` so the deadline asserted
         # below can only have come from the budget. The closed ledger is
         # process-global, so this clears it itself.
         budget = 3.0
-        assert budget > service_module._CLEAR_FLOOR
+        assert budget > service_module._MIN_CLEAR_TIMEOUT
         mocker.patch.object(service_module, "_DRAIN_TIMEOUT", budget)
         _closed.clear()
         proxy_clear_started = threading.Event()
@@ -3316,7 +3314,7 @@ class TestWorkerService:
         assert _closed == ["channel"]
         # The worker loop's clock is this loop's clock, so the deadline
         # the clear was handed is comparable here. A floor-supplied
-        # bound would sit `_CLEAR_FLOOR` past the clear, not a whole
+        # bound would sit `_MIN_CLEAR_TIMEOUT` past the clear, not a whole
         # budget past the request that started the teardown.
         [deadline] = handed
         assert deadline is not None
@@ -3336,7 +3334,7 @@ class TestWorkerService:
         mocker: MockerFixture,
         mock_worker_proxy_cache,
     ):
-        """Test a clear reached with nothing left still gets `_CLEAR_FLOOR`.
+        """Test a clear reached with nothing left still gets `_MIN_CLEAR_TIMEOUT`.
 
         Given:
             A `WorkerService` that has serviced a dispatch, leaving one
@@ -3345,7 +3343,7 @@ class TestWorkerService:
         When:
             The stop RPC is invoked with a positive timeout
         Then:
-            It should hand the channel clear a deadline `_CLEAR_FLOOR`
+            It should hand the channel clear a deadline `_MIN_CLEAR_TIMEOUT`
             in its own future rather than one already past, which is
             the whole of what the floor buys and what a test asserting
             only on the budget cannot see
@@ -3384,8 +3382,8 @@ class TestWorkerService:
         [(entered, deadline)] = handed
         # The bound is taken just before the call, so the margin the
         # clear observes is the floor less the microseconds in between.
-        assert 0 < deadline - entered <= service_module._CLEAR_FLOOR
-        assert deadline - entered > service_module._CLEAR_FLOOR / 2
+        assert 0 < deadline - entered <= service_module._MIN_CLEAR_TIMEOUT
+        assert deadline - entered > service_module._MIN_CLEAR_TIMEOUT / 2
 
     @pytest.mark.asyncio
     async def test_stop_should_drain_the_worker_loop_when_channel_clear_hangs(
@@ -3510,7 +3508,7 @@ class TestWorkerService:
         # Assert
         assert isinstance(stop_result, protocol.Void)
         assert grpc_servicer.stopped.is_set()
-        assert elapsed < budget + service_module._CLEAR_FLOOR + _GRPC_SLACK
+        assert elapsed < budget + service_module._MIN_CLEAR_TIMEOUT + _GRPC_SLACK
         assert any(
             record.name == "wool.runtime.worker.service"
             and "The channel pool clear exceeded" in record.getMessage()
@@ -3935,7 +3933,7 @@ class TestWorkerService:
                 # which is the floor, not the budget, at these values --
                 # and short enough that a cancelled clear cannot outlive
                 # the example.
-                await asyncio.sleep(service_module._CLEAR_FLOOR * 2)
+                await asyncio.sleep(service_module._MIN_CLEAR_TIMEOUT * 2)
 
             return clear
 
