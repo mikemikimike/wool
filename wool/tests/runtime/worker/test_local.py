@@ -491,9 +491,9 @@ class TestLocalWorker:
         request = mock_stub.stop.await_args.args[0]
         assert request.timeout == grace
         deadline = mock_stub.stop.await_args.kwargs["timeout"]
-        assert deadline == 2 * grace + local_module._STOP_RPC_MARGIN
+        assert deadline == 2 * grace + local_module.STOP_RPC_MARGIN
         assert deadline > grace + (
-            service_module._DRAIN_TIMEOUT + 3 * service_module._CLEAR_FLOOR
+            service_module._DRAIN_TIMEOUT + 3 * service_module._MIN_CLEAR_TIMEOUT
         )
         mock_process.reap.assert_called_once_with(grace)
 
