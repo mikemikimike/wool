@@ -2801,27 +2801,28 @@ class TestWorkerService:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("request_timeout", [0, 0.2])
-    async def test_stop_should_return_within_request_timeout_when_worker_thread_blocked(
+    async def test_stop_should_bound_each_wait_by_request_timeout_when_thread_blocked(
         self,
         grpc_aio_stub,
         mock_worker_proxy_cache,
         worker_thread_block,
-        request_timeout,
         caplog,
     ):
-        """Test `WorkerService.stop` honors bounded timeouts on a blocked thread.
+        """Test `WorkerService.stop` budgets a positive timeout once per wait.
 
         Given:
             A warm worker loop whose daemon thread is blocked by a task a
             routine left behind, with no idle retirement in flight
         When:
-            The stop RPC is invoked with a zero or positive timeout
+            The stop RPC is invoked with a positive timeout
         Then:
-            It should return within that timeout with the service
-            stopped, reporting any join overrun at debug level
+            It should wait up to the timeout once for the pre-empt grace
+            and once for the thread join — returning within twice the
+            timeout with the service stopped — and report the join
+            overrun at debug level
         """
         # Arrange
+        request_timeout = 0.2
         key, block = worker_thread_block
         loop = asyncio.get_running_loop()
         service = WorkerService()
@@ -2840,19 +2841,60 @@ class TestWorkerService:
         # Assert
         assert isinstance(stop_result, protocol.Void)
         assert service.stopped.is_set()
-        assert elapsed < (2 * request_timeout if request_timeout else 0.5) + _GRPC_SLACK
+        assert elapsed < 2 * request_timeout + _GRPC_SLACK
         overruns = [
             record for record in caplog.records if "still running" in record.getMessage()
         ]
-        if request_timeout:
-            # The wedged thread outlives the bound the caller chose, so
-            # the overrun is reported at debug, never warning.
-            assert overruns
-            assert all(record.levelno == logging.DEBUG for record in overruns)
-        else:
-            # A zero timeout performs no synchronous join, so there is
-            # no overrun to report.
-            assert not overruns
+        # The wedged thread outlives the bound the caller chose, so the
+        # overrun is reported at debug, never warning.
+        assert overruns
+        assert all(record.levelno == logging.DEBUG for record in overruns)
+
+    @pytest.mark.asyncio
+    async def test_stop_should_not_join_worker_thread_when_timeout_zero(
+        self,
+        grpc_aio_stub,
+        mock_worker_proxy_cache,
+        worker_thread_block,
+        caplog,
+    ):
+        """Test `WorkerService.stop` skips the join on a zero timeout.
+
+        Given:
+            A warm worker loop whose daemon thread is blocked by a task a
+            routine left behind, with no idle retirement in flight
+        When:
+            The stop RPC is invoked with a zero timeout
+        Then:
+            It should return without joining the worker thread — within
+            transport slack alone, with the service stopped and no
+            overrun reported
+        """
+        # Arrange
+        key, block = worker_thread_block
+        loop = asyncio.get_running_loop()
+        service = WorkerService()
+
+        async with grpc_aio_stub(servicer=service) as stub:
+            await _wedge_worker_thread(stub, key, block)
+
+            # Act
+            with caplog.at_level(logging.DEBUG, logger="wool.runtime.worker.service"):
+                started = loop.time()
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=0)), timeout=10
+                )
+                elapsed = loop.time() - started
+
+        # Assert
+        assert isinstance(stop_result, protocol.Void)
+        assert service.stopped.is_set()
+        assert elapsed < _GRPC_SLACK
+        # A zero timeout performs no synchronous join, so there is no
+        # overrun to report.
+        assert not any(
+            "still running" in record.getMessage() for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_stop_should_wait_for_blocked_worker_thread_when_timeout_negative(
