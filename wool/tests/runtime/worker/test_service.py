@@ -2751,6 +2751,7 @@ class TestWorkerService:
     async def test_stop_should_return_within_retirement_bound_when_retirement_blocked(
         self,
         grpc_aio_stub,
+        mocker: MockerFixture,
         mock_worker_proxy_cache,
         worker_thread_block,
         retirement_budget,
@@ -2775,14 +2776,33 @@ class TestWorkerService:
 
         async with grpc_aio_stub(servicer=service) as stub:
             await _wedge_worker_thread(stub, key, block)
-            await asyncio.sleep(0.8 + 0.1)
+            joining = threading.Event()
+            stop_started = threading.Event()
+            assert block.thread is not None
+            join = block.thread.join
+            set_stopping = service._stopping.set
 
-            # Act
-            started = loop.time()
-            stop_result = await asyncio.wait_for(
-                stub.stop(protocol.StopRequest(timeout=-1)), timeout=5
-            )
-            elapsed = loop.time() - started
+            def signal_stop():
+                set_stopping()
+                stop_started.set()
+
+            def signal_join(timeout=None):
+                joining.set()
+                assert stop_started.wait(5), "stop did not start during retirement"
+                return join(timeout)
+
+            mocker.patch.object(service._stopping, "set", side_effect=signal_stop)
+            mocker.patch.object(block.thread, "join", side_effect=signal_join)
+            with _join_overrun_warning() as overrun_logged:
+                assert await loop.run_in_executor(None, joining.wait, 5)
+                assert not overrun_logged.is_set()
+
+                # Act while the retirement's join still holds the pool lock.
+                started = loop.time()
+                stop_result = await asyncio.wait_for(
+                    stub.stop(protocol.StopRequest(timeout=-1)), timeout=5
+                )
+                elapsed = loop.time() - started
 
         # Assert
         assert isinstance(stop_result, protocol.Void)
